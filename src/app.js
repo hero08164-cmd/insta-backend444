@@ -11,9 +11,7 @@ import errorMiddleware from "./middlewares/error.middleware.js";
 // SINGLE MASTER ROUTE ONLY
 import postRoutes from "./routes/post.routes.js";
 import settingsRoutes from "./routes/settings.routes.js";
-// dashboardRoutes के बजाय कोई भी नाम रख सकते हैं (जैसे dashboardRoutes या router)
 import dashboardRoutes from "./routes/dashboard.routes.js";
-
 import testRoutes from "./routes/test.routes.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -28,19 +26,31 @@ const app = express();
  */
 const allowedOrigins = [
   "http://localhost:5173",
-  "https://td1212989-ux-instagram-auto-post-frontend.instagramautopost.workers.dev",
+  "http://localhost:8080",
   "http://127.0.0.1:5173",
   "http://127.0.0.1:8080",
   process.env.FRONTEND_URL,
-  "https://td1212989-ux-instagram-auto-post-frontend.instagramautopost.workers.dev",
+  "https://instagram-post-gamma.vercel.app",
 ].filter(Boolean);
 
 app.use(
   cors({
     origin(origin, callback) {
+      // Allow requests with no origin (mobile apps, curl, etc.)
       if (!origin) return callback(null, true);
 
+      // Check exact match
       if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      // Allow ALL vercel.app subdomains (preview + production)
+      if (/\.vercel\.app$/.test(origin)) {
+        return callback(null, true);
+      }
+
+      // Allow localhost any port (for local dev)
+      if (/^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)) {
         return callback(null, true);
       }
 
@@ -49,7 +59,7 @@ app.use(
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-cron-secret"],
   })
 );
 
@@ -103,7 +113,6 @@ app.get("/api/health", (req, res) => {
  * =========================
  */
 app.use("/api/posts", postRoutes);
-
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/test", testRoutes);
