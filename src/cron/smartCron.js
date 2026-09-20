@@ -5,40 +5,16 @@ import { getSettingsService } from "../services/settings.service.js";
 import DailyLock from "../models/dailyLock.model.js";
 import { emitEvent } from "../realtime/socket.helper.js";
 
-/**
- * =========================
- * DAILY LOCK CHECK
- * =========================
- */
-const isAlreadyPostedToday = async () => {
-  const today = new Date().toISOString().split("T")[0];
-  const lock = await DailyLock.findOne({ date: today });
-  return !!lock;
+const getTodayDateInTimezone = (timezone) => {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  return formatter.format(new Date()); // YYYY-MM-DD in that timezone
 };
 
-/**
- * =========================
- * SET DAILY LOCK
- * =========================
- */
-const setDailyLock = async () => {
-  const today = new Date().toISOString().split("T")[0];
-
-  await DailyLock.findOneAndUpdate(
-    { date: today },
-    { date: today, status: "posted" },
-    { upsert: true, new: true }
-  );
-};
-
-/**
- * =========================
- * GET CURRENT TIME IN A GIVEN TIMEZONE
- * =========================
- * Settings.timezone के हिसाब से अभी का समय "HH:mm" format
- * में निकालता है (जैसे "07:00"), बिना किसी extra library के —
- * Node का built-in Intl API काफी है.
- */
 const getCurrentTimeInTimezone = (timezone) => {
   const formatter = new Intl.DateTimeFormat("en-GB", {
     timeZone: timezone,
@@ -46,100 +22,92 @@ const getCurrentTimeInTimezone = (timezone) => {
     minute: "2-digit",
     hour12: false,
   });
-
-  return formatter.format(new Date()); // e.g. "07:00"
+  return formatter.format(new Date());
 };
 
-/**
- * =========================
- * CORE JOB LOGIC (REUSABLE — MANUAL TEST के लिए भी)
- * =========================
- * @param {boolean} ignoreLock - true पास करने पर DailyLock
- *   check skip हो जाएगा (sirf manual testing ke liye use करें).
- */
-export const runSmartCronJob = async ({ ignoreLock = false } = {}) => {
+const timeToMinutes = (timeStr) => {
+  const [h, m] = timeStr.split(":").map(Number);
+  return h * 60 + m;
+};
+
+const isAlreadyPostedToday = async (timezone) => {
+  const today = getTodayDateInTimezone(timezone);
+  const lock = await DailyLock.findOne({ date: today });
+  return!!lock;
+};
+
+const setDailyLock = async (timezone) => {
+  const today = getTodayDateInTimezone(timezone);
+  await DailyLock.findOneAndUpdate(
+    { date: today },
+    { date: today, status: "posted" },
+    { upsert: true, new: true }
+  );
+};
+
+export const runSmartCronJob = async ({ ignoreLock = false, timezone = "Asia/Kolkata" } = {}) => {
   console.log("🔥 SMART CRON TRIGGERED");
 
-  // 1. DAILY LOCK CHECK
   if (!ignoreLock) {
-    const alreadyPosted = await isAlreadyPostedToday();
-
+    const alreadyPosted = await isAlreadyPostedToday(timezone);
     if (alreadyPosted) {
-      console.log("⚠️ Already posted today. Skipping cron.");
+      console.log("⚠ Already posted today. Skipping cron.");
       return { skipped: true, reason: "already_posted_today" };
     }
   }
 
-  // 2. GET SMART POST (reel > image fallback logic inside service)
   const post = await getSmartNextPost();
-
   if (!post) {
-    console.log("⚠️ No pending posts found.");
+    console.log("⚠ No pending posts found.");
     return { skipped: true, reason: "no_pending_posts" };
   }
 
   console.log("🚀 Selected Post:", post._id);
-
-  // 3. POST TO INSTAGRAM
   const result = await postNowService(post._id);
 
-  // 4. SOCKET EVENTS
   emitEvent("queue:update", result);
   emitEvent("dashboard:update", result);
   emitEvent("history:update", result);
 
-  // 5. DAILY LOCK SET
   if (!ignoreLock) {
-    await setDailyLock();
+    await setDailyLock(timezone);
   }
 
   console.log("✅ DAILY POST COMPLETED SUCCESSFULLY");
-
   return { skipped: false, post: result };
 };
 
-/**
- * =========================
- * SMART CRON ENGINE (DYNAMIC — FRONTEND CONTROLLED)
- * =========================
- * अब ये hardcoded time पर नहीं चलता. ये हर मिनट चलता है,
- * और हर बार DB (Settings.dailyTime + Settings.timezone) से
- * असली scheduled time पढ़ता है. अगर अभी का समय उससे match
- * करे, तभी post होता है — वरना चुपचाप skip.
- *
- * इसका मतलब: Frontend Settings page से time बदलकर "Save"
- * दबाते ही, बिना backend restart किए, अगले matching मिनट से
- * नया time अपने-आप असर करने लगेगा.
- */
 export const startSmartCron = () => {
   cron.schedule("* * * * *", async () => {
     try {
       const settings = await getSettingsService();
       const { dailyTime, timezone } = settings;
+      const tz = timezone || "Asia/Kolkata";
 
-      const currentTime = getCurrentTimeInTimezone(timezone || "Asia/Kolkata");
+      const currentTime = getCurrentTimeInTimezone(tz);
+      const today = getTodayDateInTimezone(tz);
 
-      // DEBUG: हर मिनट दिखाएगा कि cron ज़िंदा है और किससे compare कर रहा है
-      console.log(
-        `🕒 [cron-check] now=${currentTime} target=${dailyTime} tz=${timezone}`
-      );
+      console.log(`🕒 [cron-check] now=${currentTime} target=${dailyTime} tz=${tz} date=${today}`);
 
-      // अभी का minute scheduled time से match नहीं करता -> chup-chap skip
-      if (currentTime !== dailyTime) {
-        return;
-      }
+      // ✅ FIX: 10 minute ka window
+      const currentMins = timeToMinutes(currentTime);
+      const targetMins = timeToMinutes(dailyTime);
 
-      console.log(
-        `⏰ Scheduled time matched (${currentTime} ${timezone}) — running auto-post`
-      );
+      // Agar ab ka time target se pehle hai -> skip
+      if (currentMins < targetMins) return;
 
-      await runSmartCronJob();
+      // Agar target se 10 min se zyada nikal gaya -> aaj ke liye miss, kal try karega
+      // Isse 09:00 target tha aur 09:05 pe server up hua to bhi post hoga
+      if (currentMins >= targetMins + 10) return;
+
+      // Window ke andar hai -> post karo
+      console.log(`⏰ Time matched in window (${currentTime} >= ${dailyTime}) — running auto-post`);
+      await runSmartCronJob({ timezone: tz });
+
     } catch (error) {
       console.error("❌ SMART CRON ERROR:", error.message);
     }
   });
 
-  console.log(
-    "🕒 Smart Cron Engine started — checking every minute against Settings.dailyTime"
-  );
+  console.log("🕒 Smart Cron Engine started — checking every minute against Settings.dailyTime");
 };
