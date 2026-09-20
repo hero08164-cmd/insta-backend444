@@ -6,34 +6,26 @@ import DailyLock from "../models/dailyLock.model.js";
 import { emitEvent } from "../realtime/socket.helper.js";
 
 const getTodayDateInTimezone = (timezone) => {
-  const formatter = new Intl.DateTimeFormat("en-CA", {
+  return new Intl.DateTimeFormat("en-CA", {
     timeZone: timezone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  return formatter.format(new Date()); // YYYY-MM-DD in that timezone
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date());
 };
 
 const getCurrentTimeInTimezone = (timezone) => {
-  const formatter = new Intl.DateTimeFormat("en-GB", {
-    timeZone: timezone,
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-  return formatter.format(new Date());
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone, hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(new Date());
 };
 
-const timeToMinutes = (timeStr) => {
-  const [h, m] = timeStr.split(":").map(Number);
+const timeToMinutes = (t) => {
+  const [h, m] = t.split(":").map(Number);
   return h * 60 + m;
 };
 
 const isAlreadyPostedToday = async (timezone) => {
   const today = getTodayDateInTimezone(timezone);
-  const lock = await DailyLock.findOne({ date: today });
-  return!!lock;
+  return !!(await DailyLock.findOne({ date: today }));
 };
 
 const setDailyLock = async (timezone) => {
@@ -41,7 +33,7 @@ const setDailyLock = async (timezone) => {
   await DailyLock.findOneAndUpdate(
     { date: today },
     { date: today, status: "posted" },
-    { upsert: true, new: true }
+    { upsert: true, new: true, returnDocument: 'after' }
   );
 };
 
@@ -49,21 +41,27 @@ export const runSmartCronJob = async ({ ignoreLock = false, timezone = "Asia/Kol
   console.log("🔥 SMART CRON TRIGGERED");
 
   if (!ignoreLock) {
-    const alreadyPosted = await isAlreadyPostedToday(timezone);
-    if (alreadyPosted) {
-      console.log("⚠ Already posted today. Skipping cron.");
+    if (await isAlreadyPostedToday(timezone)) {
+      console.log("⚠ Already posted today. Skipping.");
       return { skipped: true, reason: "already_posted_today" };
     }
   }
 
   const post = await getSmartNextPost();
   if (!post) {
-    console.log("⚠ No pending posts found.");
+    console.log("⚠ No pending posts.");
     return { skipped: true, reason: "no_pending_posts" };
   }
 
-  console.log("🚀 Selected Post:", post._id);
+  console.log("🚀 Selected Post:", post._id, "type:", post.type);
+
+  // ✅ FIX: result check karo
   const result = await postNowService(post._id);
+
+  if (!result.success) {
+    console.log("❌ Post failed, NOT setting DailyLock - will retry next window");
+    throw new Error(result.error || result.message);
+  }
 
   emitEvent("queue:update", result);
   emitEvent("dashboard:update", result);
@@ -81,31 +79,26 @@ export const startSmartCron = () => {
   cron.schedule("* * * * *", async () => {
     try {
       const settings = await getSettingsService();
-      const { dailyTime, timezone } = settings;
-      const tz = timezone || "Asia/Kolkata";
+      const tz = settings.timezone || "Asia/Kolkata";
+      const dailyTime = settings.dailyTime;
 
       const currentTime = getCurrentTimeInTimezone(tz);
       const today = getTodayDateInTimezone(tz);
 
       console.log(`🕒 [cron-check] now=${currentTime} target=${dailyTime} tz=${tz} date=${today}`);
 
-      // ✅ FIX: 10 minute ka window
-      const currentMins = timeToMinutes(currentTime);
+      const curMins = timeToMinutes(currentTime);
       const targetMins = timeToMinutes(dailyTime);
 
-      // Agar ab ka time target se pehle hai -> skip
-      if (currentMins < targetMins) return;
+      if (curMins < targetMins) return;
+      if (curMins >= targetMins + 10) return; // 10 min window
 
-      // Agar target se 10 min se zyada nikal gaya -> aaj ke liye miss, kal try karega
-      // Isse 09:00 target tha aur 09:05 pe server up hua to bhi post hoga
-      if (currentMins >= targetMins + 10) return;
-
-      // Window ke andar hai -> post karo
-      console.log(`⏰ Time matched in window (${currentTime} >= ${dailyTime}) — running auto-post`);
+      console.log(`⏰ Matched (${currentTime} >= ${dailyTime}) — posting`);
       await runSmartCronJob({ timezone: tz });
 
     } catch (error) {
       console.error("❌ SMART CRON ERROR:", error.message);
+      // fail hone pe lock nahi lagega, agle minute retry hoga
     }
   });
 
