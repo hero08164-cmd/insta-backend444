@@ -7,8 +7,21 @@ const router = express.Router();
 router.get("/", getSettings);
 router.put("/", updateSettings);
 
-// ✅ TEMP FIX: Aaj ka DailyLock clear karne ke liye
-// Isse purana 2026-09-20 wala lock delete hoga jo fail ke baad bhi lag gaya tha
+// ✅ FIX: GET + DELETE dono support - browser se khulega
+router.get("/clear-lock", async (req, res) => {
+  try {
+    const result = await DailyLock.deleteMany({});
+    console.log(`🗑️ DailyLock cleared: ${result.deletedCount} docs deleted`);
+    res.json({ 
+      success: true, 
+      message: `Cleared ${result.deletedCount} lock(s) - ab cron fir se chalega`,
+      deletedCount: result.deletedCount
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.delete("/clear-lock", async (req, res) => {
   try {
     const result = await DailyLock.deleteMany({});
@@ -23,10 +36,9 @@ router.delete("/clear-lock", async (req, res) => {
   }
 });
 
-// Single date clear karna ho to
-router.delete("/clear-lock/:date", async (req, res) => {
+router.get("/clear-lock/:date", async (req, res) => {
   try {
-    const { date } = req.params; // 2026-09-20
+    const { date } = req.params;
     const result = await DailyLock.deleteOne({ date });
     res.json({ success: true, message: `Lock for ${date} cleared`, deletedCount: result.deletedCount });
   } catch (err) {
